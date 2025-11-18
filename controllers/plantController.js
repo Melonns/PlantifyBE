@@ -1,31 +1,12 @@
-const axios = require('axios');
+const axios = require("axios");
+// Import SDK Gemini
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // ==========================================================
-// KAMUS MINI UNTUK MENERJEMAHKAN DATA PERENUAL
+// Inisialisasi Klien Gemini
 // ==========================================================
-const translateWatering = (watering) => {
-  const map = {
-    "Frequent": "Sering (2-3x seminggu)",
-    "Average": "Sedang (1x seminggu)",
-    "Minimum": "Jarang (2-3x sebulan)",
-    "None": "Sangat Jarang"
-  };
-  return map[watering] || watering; // Kembalikan terjemahan atau teks aslinya
-};
-
-const translateSunlight = (sunlightArray) => {
-  if (!sunlightArray || sunlightArray.length === 0) return "Info tidak tersedia";
-  
-  const map = {
-    "full_sun": "Matahari Penuh",
-    "part_shade": "Teduh Sebagian",
-    "full_shade": "Teduh Penuh",
-    "indirect_light": "Cahaya Tidak Langsung"
-  };
-  
-  // Terjemahkan setiap item di array
-  return sunlightArray.map(s => map[s] || s).join(', ');
-};
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 // ==========================================================
 // FUNGSI GET ALL PLANTS (DUMMY)
@@ -33,128 +14,193 @@ const translateSunlight = (sunlightArray) => {
 const getAllPlants = (req, res) => {
   try {
     const plants = [
-      { id: 1, name: 'Monstera' },
-      { id: 2, name: 'Lidah Buaya' }
+      { id: 1, name: "Monstera" },
+      { id: 2, name: "Lidah Buaya" },
     ];
     res.status(200).json({
-      status: 'success',
-      data: plants
+      status: "success",
+      data: plants,
     });
   } catch (error) {
     res.status(500).json({
-      status: 'error',
-      message: 'Server error'
+      status: "error",
+      message: "Server error",
     });
   }
 };
 
 // ==========================================================
-// FUNGSI UTAMA SCAN PLANT
+// FUNGSI UTAMA SCAN PLANT (DENGAN GEMINI)
 // ==========================================================
 const scanPlant = async (req, res) => {
+  // --- Deklarasi variabel di scope atas ---
+  let fullScientificName, cleanScientificName, confidence;
+  let plantNetCommonName = null;
+  let finalCommonName = null;
+  let careData = {};
+  let finalData = {};
+
   try {
     // --- 1. Validasi File ---
     if (!req.file) {
       return res.status(400).json({
-        status: 'error',
-        message: 'Tidak ada file gambar yang diupload'
+        status: "error",
+        message: "Tidak ada file gambar yang diupload",
       });
     }
 
-    // --- 2. PANGGILAN API PERTAMA: PLANTNET (Identifikasi) ---
+    // --- 2. PANGGILAN API PERTAMA: PLANTNET ---
     console.log("Mengirim request ke PlantNet...");
     const plantNetApiKey = process.env.plantnet_api;
     const imageBuffer = req.file.buffer;
     const imageBlob = new Blob([imageBuffer], { type: req.file.mimetype });
     const form = new FormData();
-    form.append('images', imageBlob, req.file.originalname);
-    
-    // Minta bahasa Indonesia ke PlantNet
+    form.append("images", imageBlob, req.file.originalname);
+
     const plantNetUrl = `https://my-api.plantnet.org/v2/identify/all?api-key=${plantNetApiKey}&lang=id`;
-    
+
     const plantNetResponse = await axios.post(plantNetUrl, form);
-    
-    // Cek hasil PlantNet
-    if (!plantNetResponse.data.results || plantNetResponse.data.results.length === 0) {
-      return res.status(404).json({ status: 'error', message: 'Tanaman tidak ditemukan oleh PlantNet' });
+
+    if (
+      !plantNetResponse.data.results ||
+      plantNetResponse.data.results.length === 0
+    ) {
+      return res
+        .status(404)
+        .json({
+          status: "error",
+          message: "Tanaman tidak ditemukan oleh PlantNet",
+        });
     }
 
     const plantNetResult = plantNetResponse.data.results[0];
-    const confidence = plantNetResult.score;
+    confidence = plantNetResult.score;
 
-    // Filter confidence
     if (confidence < 0.15) {
       return res.status(200).json({
-        status: 'success',
-        message: 'Tanaman tidak dapat dikenali',
-        data: { isPlant: false, confidence: confidence }
+        status: "success",
+        message: "Tanaman tidak dapat dikenali",
+        data: { isPlant: false, confidence: confidence },
       });
     }
 
-    // Ekstrak data penting dari PlantNet
-    const fullScientificName = plantNetResult.species.scientificName; // Nama lengkap (utk final JSON)
-    const cleanScientificName = plantNetResult.species.scientificNameWithoutAuthor; // Nama bersih (utk kueri Perenual)
-    
-    const commonName = (plantNetResult.species.commonNames && plantNetResult.species.commonNames.length > 0)
-                        ? plantNetResult.species.commonNames[0]
-                        : cleanScientificName; // Cadangan pakai nama bersih
-    
-    // --- 3. PANGGILAN API KEDUA: PERENUAL (Detail Perawatan) ---
-    console.log(`Mencari detail perawatan untuk: ${cleanScientificName}`); // Log nama yg bersih
-    
-    // Siapkan key dan URL Perenual
-    const perenualApiKey = process.env.perenual_api; // Sesuai nama di .env
-    const encodedScientificName = encodeURIComponent(cleanScientificName); // Gunakan nama bersih
-    const perenualUrl = `https://perenual.com/api/species-list?key=${perenualApiKey}&q=${encodedScientificName}`;
+    fullScientificName = plantNetResult.species.scientificName;
+    cleanScientificName = plantNetResult.species.scientificNameWithoutAuthor;
+    plantNetCommonName =
+      plantNetResult.species.commonNames &&
+      plantNetResult.species.commonNames.length > 0
+        ? plantNetResult.species.commonNames[0]
+        : null;
 
-    let careData = {}; // Default object
+    finalCommonName = plantNetCommonName || cleanScientificName;
+
+    // --- 3. PANGGILAN API KEDUA: GEMINI ---
+    console.log(
+      `Meminta data perawatan ke Gemini untuk: ${cleanScientificName}`
+    );
 
     try {
-      const perenualResponse = await axios.get(perenualUrl);
-
-      // Cek apakah Perenual menemukan datanya
-      if (perenualResponse.data.data && perenualResponse.data.data.length > 0) {
-        const plantDetails = perenualResponse.data.data[0];
+      // ==========================================================
+      // PROMPT BARU: Meminta 'instruksi' (singkat) dan 'detail' (panjang)
+      // ==========================================================
+      const prompt = `
+        Anda adalah seorang ahli botani untuk aplikasi Plantify.
+        Berikan data perawatan untuk tanaman dengan nama ilmiah "${cleanScientificName}".
         
-        // Terjemahkan data perawatan
-        careData = {
-          watering: translateWatering(plantDetails.watering),
-          sunlight: translateSunlight(plantDetails.sunlight),
-          description: plantDetails.description || "Deskripsi tidak tersedia." // Deskripsi masih B. Inggris
-        };
+        Jawab HANYA dalam format JSON yang valid.
+        JANGAN gunakan markdown (seperti \`\`\`json).
+        JANGAN tambahkan teks pembuka atau penutup.
+        Gunakan Bahasa Indonesia yang ringkas dan jelas.
 
-      } else {
-        console.log("Perenual tidak menemukan data, kirim default.");
-        careData = { watering: "Info tidak tersedia", sunlight: "Info tidak tersedia", description: "Info tidak tersedia" };
-      }
-    } catch (perenualError) {
-      console.error("Error dari Perenual:", perenualError.message);
-      // Jika Perenual error, kita tetap lanjut, tapi kirim data default
-      careData = { watering: "Gagal memuat info", sunlight: "Gagal memuat info", description: "Gagal memuat info" };
+        Untuk setiap dari 7 kunci (pupuk, air, cahaya, suhu, media_tanam, ganti_pot, masalah_umum),
+        berikan sebuah objek yang berisi dua sub-kunci:
+        1. "instruksi": Ringkasan singkat dalam 3-5 kata (contoh: "Siram 2-3 minggu sekali").
+        2. "detail": Penjelasan detail dari instruksi tersebut (contoh: "Siram tanah secara menyeluruh, lalu biarkan benar-benar kering sebelum menyiram lagi...").
+        
+        Format JSON harus seperti ini:
+        {
+          "pupuk": {
+            "instruksi": "Ringkasan singkat pupuk",
+            "detail": "Penjelasan detail mengenai pemupukan (kapan, jenis, seberapa sering)."
+          },
+          "air": {
+            "instruksi": "Ringkasan singkat air",
+            "detail": "Penjelasan detail mengenai penyiraman (seberapa sering, seberapa basah, tanda-tanda)."
+          },
+          "cahaya": {
+            "instruksi": "Ringkasan singkat cahaya",
+            "detail": "Penjelasan detail mengenai kebutuhan cahaya (langsung, tidak langsung, toleransi)."
+          },
+          "suhu": {
+            "instruksi": "Ringkasan singkat suhu",
+            "detail": "Penjelasan detail mengenai suhu dan kelembapan ideal."
+          },
+          "media_tanam": {
+            "instruksi": "Ringkasan singkat media tanam",
+            "detail": "Penjelasan detail mengenai media tanam atau campuran tanah yang ideal."
+          },
+          "ganti_pot": {
+            "instruksi": "Ringkasan singkat ganti pot",
+            "detail": "Penjelasan detail mengenai kapan dan bagaimana ganti pot (repotting)."
+          },
+          "masalah_umum": {
+            "instruksi": "Ringkasan singkat masalah",
+            "detail": "Instruksi untuk troubleshooting masalah umum (misal: daun kuning, hama, daun terkulai)."
+          }
+        }
+        
+        Jika Anda tidak tahu tanamannya, kembalikan JSON dengan nilai "Info tidak tersedia" untuk "instruksi" dan "detail" di semua 7 kunci.
+      `;
+
+      // Panggil API Gemini
+      const result = await geminiModel.generateContent(prompt);
+      const response = await result.response;
+      const textResponse = response.text();
+
+      console.log("Balasan mentah dari Gemini:", textResponse);
+
+      // Parsing JSON dari balasan Gemini
+      careData = JSON.parse(textResponse);
+    } catch (geminiError) {
+      console.error("Error dari Gemini:", geminiError.message);
+      // Fallback jika Gemini error
+      const errorDetail = {
+        instruksi: "Info gagal dimuat",
+        detail: "Info perawatan gagal dimuat.",
+      };
+      careData = {
+        pupuk: errorDetail,
+        air: errorDetail,
+        cahaya: errorDetail,
+        suhu: errorDetail,
+        media_tanam: errorDetail,
+        ganti_pot: errorDetail,
+        masalah_umum: errorDetail,
+      };
     }
+    // ==========================================================
 
     // --- 4. GABUNGKAN SEMUA DATA DAN KIRIM KE KOTLIN ---
-    const finalData = {
+    finalData = {
       isPlant: true,
-      scientificName: fullScientificName, // Kirim nama lengkap ke user
-      commonName: commonName,
+      scientificName: fullScientificName,
+      commonName: finalCommonName,
       confidence: confidence,
-      care: careData // Data perawatan
+      care: careData, // 'careData' sekarang berisi objek bersarang
     };
 
     res.status(200).json({
-      status: 'success',
-      message: 'Scan berhasil',
-      data: finalData
+      status: "success",
+      message: "Scan berhasil",
+      data: finalData,
     });
-
   } catch (error) {
-    // Error handling utama (jika PlantNet gagal, dll)
-    console.error("Error saat scan:", error.response ? error.response.data : error.message);
+    // Error handling utama
+    console.error("Error saat scan (Outer):", error.message);
     res.status(500).json({
-      status: 'error',
-      message: 'Gagal memproses gambar',
-      error: error.message
+      status: "error",
+      message: "Gagal memproses gambar",
+      error: error.message,
     });
   }
 };
@@ -162,5 +208,5 @@ const scanPlant = async (req, res) => {
 // Ekspor semua fungsi
 module.exports = {
   getAllPlants,
-  scanPlant
+  scanPlant,
 };
