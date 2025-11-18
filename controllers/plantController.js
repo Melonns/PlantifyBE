@@ -65,12 +65,10 @@ const scanPlant = async (req, res) => {
       !plantNetResponse.data.results ||
       plantNetResponse.data.results.length === 0
     ) {
-      return res
-        .status(404)
-        .json({
-          status: "error",
-          message: "Tanaman tidak ditemukan oleh PlantNet",
-        });
+      return res.status(404).json({
+        status: "error",
+        message: "Tanaman tidak ditemukan oleh PlantNet",
+      });
     }
 
     const plantNetResult = plantNetResponse.data.results[0];
@@ -105,77 +103,112 @@ const scanPlant = async (req, res) => {
       // ==========================================================
       const prompt = `
         Anda adalah seorang ahli botani untuk aplikasi Plantify.
-        Berikan data perawatan untuk tanaman dengan nama ilmiah "${cleanScientificName}".
+        Berikan data lengkap untuk tanaman dengan nama ilmiah "${cleanScientificName}".
         
         Jawab HANYA dalam format JSON yang valid.
         JANGAN gunakan markdown (seperti \`\`\`json).
         JANGAN tambahkan teks pembuka atau penutup.
         Gunakan Bahasa Indonesia yang ringkas dan jelas.
 
-        Untuk setiap dari 7 kunci (pupuk, air, cahaya, suhu, media_tanam, ganti_pot, masalah_umum),
-        berikan sebuah objek yang berisi dua sub-kunci:
-        1. "instruksi": Ringkasan singkat dalam 3-5 kata (contoh: "Siram 2-3 minggu sekali").
-        2. "detail": Penjelasan detail dari instruksi tersebut (contoh: "Siram tanah secara menyeluruh, lalu biarkan benar-benar kering sebelum menyiram lagi...").
-        
-        Format JSON harus seperti ini:
+        Format JSON harus memiliki dua kunci utama: "ringkasan" dan "perawatan".
+
+        1. "ringkasan": Harus berisi objek dengan kunci:
+          - "deskripsi": Penjelasan singkat tentang tanaman ini.
+          - "status": Info tambahan (misal: "Ramah hewan", "Tidak ramah hewan", "Pembersih udara").
+          - "keamanan": Info toksisitas (misal: "Tidak beracun", "Beracun ringan jika tertelan", "Sangat beracun").
+          - "fungsi_singkat": 1-5 kata fungsi utama (misal: "Tanaman Hias Gantung", "Peneduh Taman").
+
+        2. "perawatan": Harus berisi 7 objek (pupuk, air, cahaya, suhu, media_tanam, ganti_pot, masalah_umum),
+          di mana setiap objek memiliki:
+          - "instruksi": Ringkasan singkat (3-5 kata).
+          - "detail": Penjelasan detail.
+
+        Contoh format JSON lengkap:
         {
-          "pupuk": {
-            "instruksi": "Ringkasan singkat pupuk",
-            "detail": "Penjelasan detail mengenai pemupukan (kapan, jenis, seberapa sering)."
+          "ringkasan": {
+            "deskripsi": "Deskripsi singkat tanaman...",
+            "status": "Tidak ramah untuk hewan peliharaan.",
+            "keamanan": "Beracun ringan jika getahnya terkena kulit atau tertelan.",
+            "fungsi_singkat": "Tanaman Hias Indoor"
           },
-          "air": {
-            "instruksi": "Ringkasan singkat air",
-            "detail": "Penjelasan detail mengenai penyiraman (seberapa sering, seberapa basah, tanda-tanda)."
-          },
-          "cahaya": {
-            "instruksi": "Ringkasan singkat cahaya",
-            "detail": "Penjelasan detail mengenai kebutuhan cahaya (langsung, tidak langsung, toleransi)."
-          },
-          "suhu": {
-            "instruksi": "Ringkasan singkat suhu",
-            "detail": "Penjelasan detail mengenai suhu dan kelembapan ideal."
-          },
-          "media_tanam": {
-            "instruksi": "Ringkasan singkat media tanam",
-            "detail": "Penjelasan detail mengenai media tanam atau campuran tanah yang ideal."
-          },
-          "ganti_pot": {
-            "instruksi": "Ringkasan singkat ganti pot",
-            "detail": "Penjelasan detail mengenai kapan dan bagaimana ganti pot (repotting)."
-          },
-          "masalah_umum": {
-            "instruksi": "Ringkasan singkat masalah",
-            "detail": "Instruksi untuk troubleshooting masalah umum (misal: daun kuning, hama, daun terkulai)."
+          "perawatan": {
+            "pupuk": {
+              "instruksi": "Pupuk sebulan sekali",
+              "detail": "Gunakan pupuk cair seimbang sebulan sekali..."
+            },
+            "air": {
+              "instruksi": "Siram saat kering",
+              "detail": "Biarkan 2-3 cm bagian atas tanah mengering..."
+            },
+            "cahaya": { "instruksi": "...", "detail": "..." },
+            "suhu": { "instruksi": "...", "detail": "..." },
+            "media_tanam": { "instruksi": "...", "detail": "..." },
+            "ganti_pot": { "instruksi": "...", "detail": "..." },
+            "masalah_umum": { "instruksi": "...", "detail": "..." }
           }
         }
-        
-        Jika Anda tidak tahu tanamannya, kembalikan JSON dengan nilai "Info tidak tersedia" untuk "instruksi" dan "detail" di semua 7 kunci.
       `;
+      let geminiResponseText = null;
+      let attempts = 0;
+      const maxRetries = 3; // Coba maksimal 3 kali
+      let delay = 1000; // Mulai dengan jeda 1 detik
+
+      while (attempts < maxRetries) {
+        try {
+          // Coba panggil Gemini
+          const result = await geminiModel.generateContent(prompt);
+          const response = await result.response;
+          geminiResponseText = response.text();
+
+          console.log("Balasan mentah dari Gemini:", geminiResponseText);
+          break; // <-- SUKSES! Keluar dari 'while' loop.
+        } catch (error) {
+          // Cek apakah ini error 503 (Overloaded)
+          if (
+            error.message &&
+            (error.message.includes("503") ||
+              error.message.includes("overloaded"))
+          ) {
+            attempts++;
+            if (attempts >= maxRetries) {
+              // Jika sudah max retries, lempar error agar ditangkap 'catch' di luar
+              throw new Error(
+                `Gemini overloaded. Gagal setelah ${maxRetries} percobaan.`
+              );
+            }
+
+            console.warn(
+              `Gemini 503. Percobaan ${attempts}. Mencoba lagi dalam ${delay}ms...`
+            );
+
+            // Tunggu (delay) sebelum loop berikutnya
+            await new Promise((resolve) => setTimeout(resolve, delay));
+
+            // Gandakan jeda untuk percobaan berikutnya (Exponential Backoff)
+            delay *= 2;
+          } else {
+            // Jika ini error lain (bukan 503), langsung lempar.
+            throw error;
+          }
+        }
+      }
 
       // Panggil API Gemini
-      const result = await geminiModel.generateContent(prompt);
-      const response = await result.response;
-      const textResponse = response.text();
-
-      console.log("Balasan mentah dari Gemini:", textResponse);
-
-      // Parsing JSON dari balasan Gemini
-      careData = JSON.parse(textResponse);
+      careData = JSON.parse(geminiResponseText);
     } catch (geminiError) {
       console.error("Error dari Gemini:", geminiError.message);
       // Fallback jika Gemini error
-      const errorDetail = {
-        instruksi: "Info gagal dimuat",
-        detail: "Info perawatan gagal dimuat.",
-      };
+      console.error("Error dari Gemini (Final):", geminiError.message);
+      
+      const errorDetail = { "instruksi": "Info gagal dimuat (server sibuk)", "detail": "Server AI sedang sibuk. Silakan coba lagi beberapa saat." };
       careData = {
-        pupuk: errorDetail,
-        air: errorDetail,
-        cahaya: errorDetail,
-        suhu: errorDetail,
-        media_tanam: errorDetail,
-        ganti_pot: errorDetail,
-        masalah_umum: errorDetail,
+        "pupuk": errorDetail,
+        "air": errorDetail,
+        "cahaya": errorDetail,
+        "suhu": errorDetail,
+        "media_tanam": errorDetail,
+        "ganti_pot": errorDetail,
+        "masalah_umum": errorDetail
       };
     }
     // ==========================================================

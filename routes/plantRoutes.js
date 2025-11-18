@@ -16,7 +16,7 @@ const upload = multer({ storage: storage });
 // oleh Kotlin dengan field 'image'"
 router.post(
   '/scan', 
-//   verifyToken, 
+  verifyToken, 
   upload.single('image'), // <-- TAMBAHKAN INI
   plantController.scanPlant
 );
